@@ -279,3 +279,74 @@ class GraphormerEncoderLayer(nn.Module):
         x_new = self.ff(self.ln_2(x_prime)) + x_prime
 
         return x_new
+
+class SparseMoE(nn.Module):
+    def __init__(self, node_dim: int, ff_dim: int, num_experts: int = 8, top_k: int = 2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        # The Router
+        self.router = nn.Linear(node_dim, num_experts)
+        
+        # The Experts (Each expert is a standard FFN)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(node_dim, ff_dim),
+                nn.GELU(),
+                nn.Linear(ff_dim, node_dim)
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [num_nodes, node_dim]
+        router_logits = self.router(x) # [num_nodes, num_experts]
+        
+        # Select Top-K experts
+        weights, indices = torch.topk(router_logits, self.top_k, dim=-1)
+        weights = F.softmax(weights, dim=-1) # Normalize weights
+        
+        output = torch.zeros_like(x)
+        
+        # Dispatch node tokens to experts
+        for i, expert in enumerate(self.experts):
+            # Find which tokens are assigned to this expert
+            mask = (indices == i).any(dim=-1)
+            if mask.any():
+                # Get the weight assigned to this expert for these specific nodes
+                # We find which of the top-k positions the current expert i occupies
+                expert_mask = (indices == i)
+                # Extract weights where expert i was chosen
+                node_weights = (weights * expert_mask.float()).sum(dim=-1, keepdim=True)
+                
+                output[mask] += node_weights[mask] * expert(x[mask])
+                
+        return output
+
+
+class MoEGraphormerEncoderLayer(nn.Module):
+    def __init__(self, node_dim, edge_dim, n_heads, ff_dim, max_path_distance, num_experts=8, top_k=2):
+        super().__init__()
+        self.node_dim = node_dim
+        self.edge_dim = edge_dim
+        
+        self.attention = GraphormerMultiHeadAttention(
+            dim_in=node_dim,
+            dim_k=node_dim,
+            dim_q=node_dim,
+            num_heads=n_heads,
+            edge_dim=edge_dim,
+            max_path_distance=max_path_distance,
+        )
+        self.ln_1 = nn.LayerNorm(self.node_dim)
+        self.ln_2 = nn.LayerNorm(self.node_dim)
+        
+        # Replace standard FFN with MoE
+        self.moe = SparseMoE(node_dim, ff_dim, num_experts, top_k)
+
+    def forward(self, x, edge_attr, b, edge_paths_tensor=None, edge_paths_length=None, ptr=None):
+        # Attention + Residual
+        x_prime = self.attention(self.ln_1(x), edge_attr, b, edge_paths_tensor, edge_paths_length, ptr) + x
+        # MoE + Residual
+        x_new = self.moe(self.ln_2(x_prime)) + x_prime
+        return x_new

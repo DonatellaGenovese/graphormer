@@ -5,6 +5,7 @@ from torch import nn
 from torch_geometric.data import Data
 
 from graphormer.layers import GraphormerEncoderLayer, CentralityEncoding, SpatialEncoding
+from graphormer.layers import MoEGraphormerEncoderLayer, SparseMoE
 
 
 class Graphormer(nn.Module):
@@ -105,3 +106,62 @@ class Graphormer(nn.Module):
         x = self.node_out_lin(x)
 
         return x
+
+
+class MoEGraphormer(nn.Module):
+    def __init__(self,
+                 num_layers: int,
+                 input_node_dim: int,
+                 node_dim: int,
+                 input_edge_dim: int,
+                 edge_dim: int,
+                 output_dim: int,
+                 n_heads: int,
+                 ff_dim: int,
+                 max_in_degree: int,
+                 max_out_degree: int,
+                 max_path_distance: int,
+                 num_experts: int = 8,
+                 top_k: int = 2):
+        super().__init__()
+        
+        self.node_in_lin = nn.Linear(input_node_dim, node_dim)
+        self.edge_in_lin = nn.Linear(input_edge_dim, edge_dim)
+
+        self.centrality_encoding = CentralityEncoding(max_in_degree, max_out_degree, node_dim)
+        self.spatial_encoding = SpatialEncoding(max_path_distance)
+
+        # Build layers with MoE
+        self.layers = nn.ModuleList([
+            MoEGraphormerEncoderLayer(
+                node_dim=node_dim,
+                edge_dim=edge_dim,
+                n_heads=n_heads,
+                ff_dim=ff_dim,
+                max_path_distance=max_path_distance,
+                num_experts=num_experts,
+                top_k=top_k
+            ) for _ in range(num_layers)
+        ])
+
+        self.node_out_lin = nn.Linear(node_dim, output_dim)
+
+    def forward(self, data):
+        x = data.x.float()
+        edge_attr = data.edge_attr.float()
+        ptr = getattr(data, 'ptr', None)
+        node_paths_length = data.node_paths_length
+
+        x = self.node_in_lin(x)
+        edge_attr = self.edge_in_lin(edge_attr)
+
+        x = self.centrality_encoding(x, data.in_degree, data.out_degree)
+        b = self.spatial_encoding(x, node_paths_length)
+
+        edge_paths_tensor = getattr(data, 'edge_paths_tensor', None)
+        edge_paths_length = getattr(data, 'edge_paths_length', None)
+
+        for layer in self.layers:
+            x = layer(x, edge_attr, b, edge_paths_tensor, edge_paths_length, ptr)
+
+        return self.node_out_lin(x)

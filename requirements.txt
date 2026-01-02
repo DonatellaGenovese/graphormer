@@ -1,3 +1,7 @@
 torch
 torch-geometric
 networkx
+rdkit
+scikit-learn
+pandas
+tables
